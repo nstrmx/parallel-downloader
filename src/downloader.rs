@@ -73,10 +73,8 @@ impl Downloader {
                     }
                     Err(err) => {
                         error!("chunk write error: {}", err);
-                        chunk.status = Status::Downloaded;
                     }
                 };
-                chunk.status = Status::Downloaded;
             }
             Err(err) => {
                 error!("request error: {}", err);
