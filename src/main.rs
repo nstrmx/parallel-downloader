@@ -1,4 +1,5 @@
-use std::{path::PathBuf, time::Instant};
+use std::{path::PathBuf, sync::Arc, time::Instant};
+use anyhow::{Context, Result};
 use structopt::StructOpt;
 use regex::Regex;
 use::log::info;
@@ -19,7 +20,7 @@ struct Opt {
     log_path: Option<PathBuf>,
 
     #[structopt(short, long)]
-    url: String,
+    url: url::Url,
 
     #[structopt(short, long, parse(from_os_str))]
     file_name: PathBuf,
@@ -32,7 +33,7 @@ struct Opt {
 }
 
 
-fn main() {
+fn main() -> Result<()> {
     let now = Instant::now();
     let opt = Opt::from_args();
     // Logging
@@ -42,31 +43,27 @@ fn main() {
         2 => log::LevelFilter::Debug,
         _ => log::LevelFilter::Trace,
     };
-    build_logger(log_level, opt.log_path);
+    build_logger(log_level, opt.log_path)?;
     // Chunk size
-    let re = Regex::new(r"(\d+)([Mm][Bb])").unwrap();
+    let re = Regex::new(r"(\d+)([Mm][Bb])")?;
     let default_chunk_size = 1024 * 1024 * 10;
-    let chunk_size = match opt.chunk_size {
-        Some(text) => {
-            if let Some(captures) = re.captures(&text) {
-                let number = captures.get(1).unwrap().as_str().parse::<usize>().unwrap();
-                number * 1024 * 1024
-            } else {
-                default_chunk_size
-            }
-        }
-        None => {
-            default_chunk_size
+    let mut chunk_size = default_chunk_size;
+    if let Some(text) = opt.chunk_size {
+        if let Some(captures) = re.captures(&text) {
+            let number = captures
+                .get(1).context("invalid chunk size format")?
+                .as_str().parse::<usize>()?;
+            chunk_size = number * 1024 * 1024;
         }
     };
     // Workers
-    let workers = match opt.workers {
-        Some(val) => val,
-        None => 8
-    };
+    let workers = opt.workers.unwrap_or(8);
     // Let's go
-    let downloader = Downloader::new(opt.url, opt.file_name, chunk_size, workers);
-    downloader.run();
+    let downloader = Arc::new(Downloader::new(
+        opt.url, opt.file_name, chunk_size, workers
+    ));
+    downloader.run()?;
     let elapsed = Instant::now() - now;
     info!("elapsed = {}", elapsed.as_secs());
+    Ok(())
 }

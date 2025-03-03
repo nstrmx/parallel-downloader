@@ -1,4 +1,5 @@
 use::std::path::PathBuf;
+use anyhow::Result;
 use log::LevelFilter;
 use log4rs::{
     append::{
@@ -10,7 +11,7 @@ use log4rs::{
     filter::threshold::ThresholdFilter,
 };
 
-pub fn build_logger(log_level: log::LevelFilter, log_path: Option<PathBuf>) -> log4rs::Handle {
+pub fn build_logger(log_level: log::LevelFilter, log_path: Option<PathBuf>) -> Result<log4rs::Handle> {
     // Build a stderr logger.
     let stderr = ConsoleAppender::builder().target(Target::Stderr).build();
     // Log Trace level output to file where trace is the default level
@@ -21,10 +22,9 @@ pub fn build_logger(log_level: log::LevelFilter, log_path: Option<PathBuf>) -> l
         let log_file = FileAppender::builder()
             // Pattern: https://docs.rs/log4rs/*/log4rs/encode/pattern/index.html
             .encoder(Box::new(PatternEncoder::new("{l} {d} - {m}\n")))
-            .build(&log_path)
-            .unwrap();
+            .build(&log_path)?;
         let appender_name = "log_file";
-        let config = config
+        config
             .appender(Appender::builder().build(appender_name, Box::new(log_file)))
             .appender(
                 Appender::builder()
@@ -36,9 +36,7 @@ pub fn build_logger(log_level: log::LevelFilter, log_path: Option<PathBuf>) -> l
                     .appender(appender_name)
                     .appender("stderr")
                     .build(LevelFilter::Trace),
-            )
-            .unwrap();
-        config
+            )?
     } else {
         config.appender(
             Appender::builder()
@@ -49,8 +47,7 @@ pub fn build_logger(log_level: log::LevelFilter, log_path: Option<PathBuf>) -> l
             Root::builder()
                 .appender("stderr")
                 .build(LevelFilter::Trace),
-        )
-        .unwrap()
+        )?
     };
-    return log4rs::init_config(config).unwrap();
+    Ok(log4rs::init_config(config)?)
 }
