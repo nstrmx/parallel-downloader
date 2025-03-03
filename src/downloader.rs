@@ -1,12 +1,11 @@
 use std::{
-    fs::{remove_file, File}, 
-    io::{Read,Write}, 
+    fs::{File, OpenOptions}, 
+    io::{Read, Seek, Write}, 
     path::PathBuf, 
-    sync::Arc, 
+    sync::{Arc, Mutex},
     thread, 
-    time::Duration,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use log::{debug, error, info};
 use url::Url;
 use crate::channel::SharedChannel;
@@ -28,19 +27,22 @@ struct Chunk {
 
 pub struct Downloader {
     url: Url,
-    file_name: PathBuf,
-    chunk_size: usize,
+    file: Mutex<File>,
     max_workers: usize,
 }
 
 impl Downloader {
-    pub fn new(url: Url, file_name: PathBuf, chunk_size: usize, max_workers: usize) -> Downloader {
-        Downloader {
+    pub fn new(url: Url, filename: PathBuf, max_workers: usize) -> Result<Arc<Downloader>> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(filename)?;
+        Ok(Arc::new(Downloader {
             url,
-            file_name,
-            chunk_size,
+            file: Mutex::new(file),
             max_workers,
-        }
+        }))
     }
 
     fn request_content_length(&self) -> Result<usize> {
@@ -53,7 +55,7 @@ impl Downloader {
 
     fn download_chunk(&self, chunk: &mut Chunk) {
         match ureq::get(self.url.as_str())
-            .set("Range", format!("bytes={}-{}", chunk.start, chunk.end).as_str())
+            .set("Range", &format!("bytes={}-{}", chunk.start, chunk.end))
             .call() 
         {
             Ok(response) => {
@@ -86,9 +88,11 @@ impl Downloader {
     }
 
     fn save_chunk(&self, chunk: &Chunk, data: &[u8]) -> Result<()> {
-        let chunk_file_name = format!("{}.chunk-{}", self.file_name.to_string_lossy(), chunk.id);
-        let mut output_chunk = File::create(chunk_file_name)?;
-        Ok(output_chunk.write_all(data)?)
+        let mut file = self.file.lock().ok().context("failed to lock file")?;
+        file.seek(std::io::SeekFrom::Start(chunk.start as u64))?;
+        file.write_all(data)?;
+        info!("merged chunk id={}, size={}", chunk.id, chunk.end - chunk.start);
+        Ok(())
     }
 
     fn start_worker(self: Arc<Self>, id: usize, task_chan: SharedChannel<Option<Chunk>>, result_chan: SharedChannel<Chunk>) -> thread::JoinHandle<Result<()>> {
@@ -107,31 +111,18 @@ impl Downloader {
         })
     }
 
-    fn merge_chunk(&self, output_file: &mut File, chunk: &Chunk) -> Result<()> {
-        let chunk_file_name = format!("{}.chunk-{}", self.file_name.to_string_lossy(), chunk.id);
-        let mut chunk_file = File::open(&chunk_file_name)?;
-        let mut data = Vec::new();
-        let n = chunk_file.read_to_end(&mut data)?;
-        let m = output_file.write(&data)?;
-        if m < n {
-            bail!(format!("error merging chunk id={}", chunk.id));
-        }
-        info!("merged chunk id={}, size={}", chunk.id, m);
-        remove_file(chunk_file_name)?;
-        Ok(())
-    }
-    
     pub fn run(self: Arc<Self>) -> Result<()> {
         // Derive number of chunks from content length
         let content_length = self.request_content_length()?;
         info!("content-length: {}", content_length);
-        let num_chunks = content_length / self.chunk_size;
+        self.file.lock().ok().context("failed to lock file")?
+            .set_len(content_length as u64)?;
+        let num_chunks = self.max_workers;
         info!("number of chunks: {}", num_chunks);
-        info!("chunk size: {}", self.chunk_size);
+        let chunk_size = content_length / num_chunks;
+        info!("chunk size: {}", chunk_size);
         // Channels
-        // let result_chan = SharedChannel::<Chunk>::new("result", self.max_workers * 2);
         let result_chan = SharedChannel::<Chunk>::new("result");
-        // let task_chan = SharedChannel::<Option<Chunk>>::new("task", self.max_workers * 2);
         let task_chan = SharedChannel::<Option<Chunk>>::new("task");
         //Start workers
         info!("number of workers: {}", self.max_workers);
@@ -144,54 +135,18 @@ impl Downloader {
         let mut chunks = Vec::with_capacity(num_chunks);
         info!("downloading chunks");
         for i in 0..num_chunks {
-            let start_byte = i * self.chunk_size;
+            let start_byte = i * chunk_size;
             let end_byte = if i == num_chunks - 1 {
                 content_length - 1
             } else {
-                (i + 1) * self.chunk_size - 1
+                (i + 1) * chunk_size - 1
             };
             let chunk = Chunk{id: i, start: start_byte, end: end_byte, status: Status::Initial};
             chunks.push(chunk.clone());
             task_chan.send(Some(chunk))?;
         }
-        // Receive chunks
-        // Failed chunks are sent back to workers
-        // Expected chunks are merged to output file
-        let mut output_file = File::create(&self.file_name)?;
-        let mut expected_id = 0;
-        let mut ok_chunks = 0;
-        while ok_chunks < num_chunks {
-            let chunk = match result_chan.try_recv() {
-                Ok(chunk) => chunk,
-                _ => {
-                    thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
-            };
-            debug!("main thread recieved chunk: {:?}", chunk);
-            match chunk.status {
-                Status::Downloaded => {
-                    chunks[chunk.id].status = Status::Downloaded;
-                    ok_chunks += 1;
-                }
-                _ => {
-                    task_chan.send(Some(chunk.clone()))?;
-                }
-            }
-            if let Status::Downloaded = chunks[expected_id].status {
-                self.merge_chunk(&mut output_file, &chunks[expected_id])?;
-                expected_id += 1;
-            }
-        }
-        // Merge the rest
-        for chunk in &chunks[expected_id..num_chunks] {
-            if let Status::Downloaded = chunk.status {
-                self.merge_chunk(&mut output_file, chunk)?;
-                expected_id += 1;
-            }
-        }
         // Send stop and join workers
-        for _worker in workers.iter() {
+        for _ in 0..workers.len() {
             task_chan.send(None)?;
         }
         for worker in workers {

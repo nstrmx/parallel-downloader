@@ -1,7 +1,6 @@
-use std::{path::PathBuf, sync::Arc, time::Instant};
-use anyhow::{Context, Result};
+use std::{num::NonZero, path::PathBuf, time::Instant};
+use anyhow::Result;
 use structopt::StructOpt;
-use regex::Regex;
 use::log::info;
 use downloader::Downloader;
 use logging::build_logger;
@@ -23,10 +22,7 @@ struct Opt {
     url: url::Url,
 
     #[structopt(short, long, parse(from_os_str))]
-    file_name: PathBuf,
-
-    #[structopt(short, long)]
-    chunk_size: Option<String>,
+    filename: PathBuf,
 
     #[structopt(short, long)]
     workers: Option<usize>,
@@ -44,25 +40,14 @@ fn main() -> Result<()> {
         _ => log::LevelFilter::Trace,
     };
     build_logger(log_level, opt.log_path)?;
-    // Chunk size
-    let re = Regex::new(r"(\d+)([Mm][Bb])")?;
-    let default_chunk_size = 1024 * 1024 * 10;
-    let mut chunk_size = default_chunk_size;
-    if let Some(text) = opt.chunk_size {
-        if let Some(captures) = re.captures(&text) {
-            let number = captures
-                .get(1).context("invalid chunk size format")?
-                .as_str().parse::<usize>()?;
-            chunk_size = number * 1024 * 1024;
-        }
-    };
     // Workers
-    let workers = opt.workers.unwrap_or(8);
+    let workers = opt.workers.unwrap_or(
+        std::thread::available_parallelism()
+            .unwrap_or(NonZero::new(8).unwrap())
+            .get()
+    );
     // Let's go
-    let downloader = Arc::new(Downloader::new(
-        opt.url, opt.file_name, chunk_size, workers
-    ));
-    downloader.run()?;
+    Downloader::new(opt.url, opt.filename, workers)?.run()?;
     let elapsed = Instant::now() - now;
     info!("elapsed = {}", elapsed.as_secs());
     Ok(())
